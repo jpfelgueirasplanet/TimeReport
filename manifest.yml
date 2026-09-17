@@ -1,0 +1,21 @@
+modules:
+  jira:fullPage:
+    - key: time-report-hello-world-full-page
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      title: Time Report
+      routePrefix: hello-world
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/f8b1d7a6-1f96-4963-a900-47d47a44b1c6

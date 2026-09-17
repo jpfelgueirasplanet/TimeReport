@@ -1,0 +1,23 @@
+{
+  "name": "jira-full-page-ui-kit",
+  "title": "Jira full page UI Kit",
+  "description": "Template for Jira full page module for UI Kit",
+  "link": "https://developer.atlassian.com/platform/forge/manifest-reference/modules/jira-full-page/",
+  "version": "1.2.22-next.14",
+  "main": "index.js",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "lint": "eslint src/**/*"
+  },
+  "devDependencies": {
+    "eslint": "^8.56.0",
+    "eslint-plugin-react-hooks": "^4.6.0"
+  },
+  "dependencies": {
+    "@forge/bridge": "7.0.0-next.11",
+    "@forge/react": "12.2.0-next.4",
+    "@forge/resolver": "2.0.0",
+    "react": "^18.2.0"
+  }
+}
