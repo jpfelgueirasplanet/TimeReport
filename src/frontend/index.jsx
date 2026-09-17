@@ -10,6 +10,7 @@ import ForgeReconciler, {
   Label,
   Link,
   LoadingButton,
+  Lozenge,
   Modal,
   ModalBody,
   ModalFooter,
@@ -22,8 +23,29 @@ import ForgeReconciler, {
   Strong,
   Text,
   Textfield,
+  xcss,
 } from '@forge/react';
 import { invoke, view } from '@forge/bridge';
+
+// Styles are declared with `xcss`, which only accepts Atlassian design tokens.
+// Using tokens (rather than raw pixel/hex values) is what makes the app pick up
+// Jira's own spacing, colours and dark mode automatically.
+const toolbarStyles = xcss({
+  backgroundColor: 'elevation.surface.raised',
+  borderColor: 'color.border',
+  borderStyle: 'solid',
+  borderWidth: 'border.width',
+  borderRadius: 'border.radius.200',
+  padding: 'space.200',
+});
+
+const filterFieldStyles = xcss({
+  minWidth: '320px',
+});
+
+const daysFieldStyles = xcss({
+  width: '120px',
+});
 
 // Columns that always appear before the per-day columns. Kept in one place so
 // the table header and the CSV export can never drift apart.
@@ -226,90 +248,122 @@ const App = () => {
 
   const csv = useMemo(() => (report ? buildCsv(report) : ''), [report]);
 
+  // Sum of every row's total, shown as a lozenge next to the filter name so the
+  // overall effort for the period is visible without scrolling the table.
+  const grandTotalHours = useMemo(() => {
+    if (!report) {
+      return 0;
+    }
+
+    return report.rows.reduce((sum, row) => sum + row.totalHours, 0);
+  }, [report]);
+
   return (
-    <Stack space="space.200">
-      <Heading as="h1">Time Report</Heading>
-      <Text>
-        Shows hours logged per person, per issue and per day for the issues returned by a saved
-        filter.
-      </Text>
-
-      {filtersError && (
-        <SectionMessage appearance="error" title="Could not load filters">
-          <Text>{filtersError}</Text>
-        </SectionMessage>
-      )}
-
-      <Inline space="space.200" alignBlock="end" shouldWrap>
-        <Box>
-          <Label labelFor="filter-select">Saved filter</Label>
-          <Select
-            id="filter-select"
-            options={filterOptions}
-            value={selectedFilter}
-            onChange={setSelectedFilter}
-            placeholder="Choose a filter..."
-            isClearable
-          />
-        </Box>
-
-        <Box>
-          <Label labelFor="days-back">Days back</Label>
-          <Textfield
-            id="days-back"
-            type="number"
-            value={daysBack}
-            onChange={(event) => setDaysBack(event.target.value)}
-          />
-        </Box>
-
-        <LoadingButton
-          appearance="primary"
-          isLoading={isLoading}
-          isDisabled={!selectedFilter}
-          onClick={runReport}
-        >
-          Run report
-        </LoadingButton>
-      </Inline>
-
-      {reportError && (
-        <SectionMessage appearance="error" title="Could not build the report">
-          <Text>{reportError}</Text>
-        </SectionMessage>
-      )}
-
-      {report && report.truncated && (
-        <SectionMessage appearance="warning" title="Results were truncated">
-          <Text>
-            The filter matched more issues than this report processes in one run. Narrow the filter
-            or reduce the number of days to see the full picture.
+    <Box padding="space.200">
+      <Stack space="space.300">
+        {/* Jira renders the page title for us (layout: basic), so we only add a
+            short subtitle here rather than repeating the heading. */}
+        <Stack space="space.050">
+          <Heading as="h2" size="medium">
+            Logged time by person, issue and day
+          </Heading>
+          <Text color="color.text.subtle">
+            Pick a saved filter and a reporting window. The report shows the hours each person
+            logged against each issue, with its epic, initiative and theme.
           </Text>
-        </SectionMessage>
-      )}
-
-      {report && (
-        <Stack space="space.150">
-          <Inline space="space.200" alignBlock="center" spread="space-between">
-            <Text>
-              <Strong>{report.filterName}</Strong> — {report.rows.length} rows across{' '}
-              {report.issueCount} issues.
-            </Text>
-            <ButtonGroup>
-              <Button onClick={() => setIsCsvOpen(true)} isDisabled={report.rows.length === 0}>
-                Export to CSV
-              </Button>
-            </ButtonGroup>
-          </Inline>
-
-          <DynamicTable
-            head={tableHead}
-            rows={tableRows}
-            rowsPerPage={50}
-            emptyView="No work was logged in this period for the selected filter."
-          />
         </Stack>
-      )}
+
+        {filtersError && (
+          <SectionMessage appearance="error" title="Could not load filters">
+            <Text>{filtersError}</Text>
+          </SectionMessage>
+        )}
+
+        {/* Toolbar card: a raised surface with a border makes the controls read as
+            a distinct Jira-style panel instead of floating on the page. */}
+        <Box xcss={toolbarStyles}>
+          <Inline space="space.200" alignBlock="end" shouldWrap>
+            <Box xcss={filterFieldStyles}>
+              <Stack space="space.050">
+                <Label labelFor="filter-select">Saved filter</Label>
+                <Select
+                  id="filter-select"
+                  options={filterOptions}
+                  value={selectedFilter}
+                  onChange={setSelectedFilter}
+                  placeholder="Choose a filter..."
+                  isClearable
+                />
+              </Stack>
+            </Box>
+
+            <Box xcss={daysFieldStyles}>
+              <Stack space="space.050">
+                <Label labelFor="days-back">Days back</Label>
+                <Textfield
+                  id="days-back"
+                  type="number"
+                  value={daysBack}
+                  onChange={(event) => setDaysBack(event.target.value)}
+                />
+              </Stack>
+            </Box>
+
+            <LoadingButton
+              appearance="primary"
+              isLoading={isLoading}
+              isDisabled={!selectedFilter}
+              onClick={runReport}
+            >
+              Run report
+            </LoadingButton>
+          </Inline>
+        </Box>
+
+        {reportError && (
+          <SectionMessage appearance="error" title="Could not build the report">
+            <Text>{reportError}</Text>
+          </SectionMessage>
+        )}
+
+        {report && report.truncated && (
+          <SectionMessage appearance="warning" title="Results were truncated">
+            <Text>
+              The filter matched more issues than this report processes in one run. Narrow the
+              filter or reduce the number of days to see the full picture.
+            </Text>
+          </SectionMessage>
+        )}
+
+        {report && (
+          <Stack space="space.150">
+            <Inline space="space.200" alignBlock="center" spread="space-between">
+              <Inline space="space.100" alignBlock="center">
+                <Strong>{report.filterName}</Strong>
+                <Lozenge appearance="inprogress">{`${report.rows.length} rows`}</Lozenge>
+                <Lozenge appearance="default">{`${report.issueCount} issues`}</Lozenge>
+                <Lozenge appearance="success">{`${grandTotalHours.toFixed(2)} h`}</Lozenge>
+              </Inline>
+              <ButtonGroup>
+                <Button
+                  iconBefore="download"
+                  onClick={() => setIsCsvOpen(true)}
+                  isDisabled={report.rows.length === 0}
+                >
+                  Export to CSV
+                </Button>
+              </ButtonGroup>
+            </Inline>
+
+            <DynamicTable
+              head={tableHead}
+              rows={tableRows}
+              rowsPerPage={50}
+              emptyView="No work was logged in this period for the selected filter."
+            />
+          </Stack>
+        )}
+      </Stack>
 
       <ModalTransition>
         {isCsvOpen && (
@@ -335,7 +389,7 @@ const App = () => {
           </Modal>
         )}
       </ModalTransition>
-    </Stack>
+    </Box>
   );
 };
 

@@ -1,12 +1,18 @@
 modules:
-  jira:fullPage:
-    - key: time-report-hello-world-full-page
+  # A global page puts the app inside Jira's own navigation chrome and adds an
+  # entry to the "Apps" menu in the top navigation bar, so it looks and feels
+  # like a native Jira screen. (A jira:fullPage module renders standalone with
+  # no Jira navigation at all.)
+  jira:globalPage:
+    - key: time-report-global-page
       resource: main
       resolver:
         function: resolver
       render: native
       title: Time Report
-      routePrefix: hello-world
+      # `native` renders the page with Jira's default page controls (title bar,
+      # spacing and theming), so the app blends into the product chrome.
+      layout: native
   function:
     - key: resolver
       handler: index.handler
