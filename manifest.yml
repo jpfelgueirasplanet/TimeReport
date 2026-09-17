@@ -19,3 +19,10 @@ app:
     memoryMB: 256
     architecture: arm64
   id: ari:cloud:ecosystem::app/f8b1d7a6-1f96-4963-a900-47d47a44b1c6
+permissions:
+  scopes:
+    # Needed to read saved filters, search issues and read worklogs as the
+    # logged in user. `read:jira-user` lets us show worklog author display names.
+    - read:jira-work
+    - read:jira-user
+
