@@ -30,31 +30,44 @@ async function readJson(responsePromise, description) {
 }
 
 /**
- * Returns the saved filters that the current user can see, so the UI can offer
- * them in a dropdown. The old script required the caller to know the numeric
- * filter id; letting the user pick from a list is friendlier.
+ * Returns saved filters the current user can see, optionally narrowed by name.
  *
- * @returns {Promise<Array<{id: string, name: string}>>}
+ * Passing a `nameQuery` uses Jira's own `filterName` matching, which is much
+ * more reliable than downloading every filter on a large site.
+ *
+ * @param {string} [nameQuery] partial filter name to search for
+ * @returns {Promise<Array<{id: string, name: string, owner: string, jql: string}>>}
  */
-export async function getVisibleFilters() {
+export async function searchFilters(nameQuery) {
   const filters = [];
   let startAt = 0;
   const maxResults = 50;
 
-  // `filter/search` is paginated, so keep going until Jira says it is the last page.
-  // The loop is bounded by `isLast` and by a hard page cap to avoid runaway requests.
-  for (let page = 0; page < 20; page += 1) {
-    const data = await readJson(
-      api
-        .asUser()
-        .requestJira(
-          route`/rest/api/3/filter/search?startAt=${startAt}&maxResults=${maxResults}&orderBy=name`
-        ),
-      'Listing saved filters'
-    );
+  // `expand=jql,owner` gives us enough to show a helpful label in the picker.
+  // `route` must be used as a tagged template so that interpolated values are
+  // URL-encoded, so we branch rather than concatenating the optional parameter.
+  for (let page = 0; page < 10; page += 1) {
+    const request = nameQuery
+      ? api
+          .asUser()
+          .requestJira(
+            route`/rest/api/3/filter/search?startAt=${startAt}&maxResults=${maxResults}&orderBy=name&expand=jql,owner&filterName=${nameQuery}`
+          )
+      : api
+          .asUser()
+          .requestJira(
+            route`/rest/api/3/filter/search?startAt=${startAt}&maxResults=${maxResults}&orderBy=name&expand=jql,owner`
+          );
+
+    const data = await readJson(request, 'Searching saved filters');
 
     for (const filter of data.values || []) {
-      filters.push({ id: String(filter.id), name: filter.name });
+      filters.push({
+        id: String(filter.id),
+        name: filter.name,
+        owner: filter.owner?.displayName || '',
+        jql: filter.jql || '',
+      });
     }
 
     if (data.isLast || !data.values || data.values.length === 0) {

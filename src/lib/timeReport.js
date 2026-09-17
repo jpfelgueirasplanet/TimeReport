@@ -220,15 +220,37 @@ function worklogDate(worklog) {
 /**
  * Builds the complete report.
  *
+ * The report can be scoped either by a saved filter or by raw JQL, mirroring
+ * the flexibility of running the old Groovy script by hand.
+ *
  * @param {object} params
- * @param {string} params.filterId id of the saved filter that scopes the report
+ * @param {string} params.sourceType either `filter` or `jql`
+ * @param {string} params.sourceValue a filter id (when `filter`) or a JQL string
  * @param {number} params.daysBack how many days before today to include
  * @returns {Promise<object>} report payload consumed by the frontend
  */
-export async function buildTimeReport({ filterId, daysBack }) {
-  const filter = await getFilter(filterId);
+export async function buildTimeReport({ sourceType, sourceValue, daysBack }) {
+  // Resolve the scope into a plain JQL string plus a human readable label.
+  let baseJql;
+  let sourceLabel;
+
+  if (sourceType === 'jql') {
+    baseJql = sourceValue;
+    sourceLabel = 'Custom JQL';
+  } else {
+    const filter = await getFilter(sourceValue);
+    baseJql = filter.jql;
+    sourceLabel = `${filter.name} (filter ${filter.id})`;
+
+    if (!baseJql) {
+      throw new Error(
+        `Filter ${filter.id} did not return any JQL. You may not have permission to view it.`
+      );
+    }
+  }
+
   const dateColumns = buildDateColumns(daysBack);
-  const jql = buildReportJql(filter.jql, daysBack);
+  const jql = buildReportJql(baseJql, daysBack);
 
   const { issues, truncated } = await searchIssues(jql, ISSUE_FIELDS, MAX_ISSUES);
 
@@ -306,7 +328,7 @@ export async function buildTimeReport({ filterId, daysBack }) {
     .sort((a, b) => a.user.localeCompare(b.user) || a.issueKey.localeCompare(b.issueKey));
 
   return {
-    filterName: filter.name,
+    sourceLabel,
     jql,
     dateColumns,
     rows: reportRows,

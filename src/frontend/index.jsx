@@ -3,9 +3,11 @@ import ForgeReconciler, {
   Box,
   Button,
   ButtonGroup,
+  Code,
   CodeBlock,
   DynamicTable,
   Heading,
+  HelperMessage,
   Inline,
   Label,
   Link,
@@ -17,11 +19,13 @@ import ForgeReconciler, {
   ModalHeader,
   ModalTitle,
   ModalTransition,
+  RadioGroup,
   SectionMessage,
   Select,
   Stack,
   Strong,
   Text,
+  TextArea,
   Textfield,
   xcss,
 } from '@forge/react';
@@ -102,9 +106,18 @@ function buildCsv(report) {
 }
 
 const App = () => {
-  const [filters, setFilters] = useState([]);
-  const [filtersError, setFiltersError] = useState(null);
-  const [selectedFilter, setSelectedFilter] = useState(null);
+  // How the user wants to scope the report: by filter id, by searching for a
+  // filter by name, or by typing JQL directly.
+  const [sourceMode, setSourceMode] = useState('id');
+  const [filterId, setFilterId] = useState('');
+  const [nameQuery, setNameQuery] = useState('');
+  const [jqlText, setJqlText] = useState('');
+
+  const [filterMatches, setFilterMatches] = useState([]);
+  const [selectedMatch, setSelectedMatch] = useState(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchMessage, setSearchMessage] = useState(null);
+
   const [daysBack, setDaysBack] = useState('7');
 
   const [report, setReport] = useState(null);
@@ -133,25 +146,79 @@ const App = () => {
     [siteUrl]
   );
 
-  // Load the list of saved filters once, when the page opens.
-  useEffect(() => {
-    invoke('getFilters')
-      .then(setFilters)
-      .catch((error) => setFiltersError(error.message || 'Could not load saved filters.'));
-  }, []);
+  /**
+   * Searches Jira for filters matching the typed name and populates the picker.
+   * An empty search box lists everything the user can see.
+   */
+  const searchForFilters = useCallback(async () => {
+    setIsSearching(true);
+    setSearchMessage(null);
+    setSelectedMatch(null);
+
+    try {
+      const result = await invoke('searchFilters', { name: nameQuery });
+
+      if (result.error) {
+        setFilterMatches([]);
+        setSearchMessage({ appearance: 'error', text: result.error });
+        return;
+      }
+
+      setFilterMatches(result.filters);
+
+      if (result.filters.length === 0) {
+        setSearchMessage({
+          appearance: 'warning',
+          text: nameQuery
+            ? `No filters matched "${nameQuery}". Note that Jira only searches filters you own or that are shared with you.`
+            : 'Jira returned no saved filters for your account. Try entering a filter ID or JQL instead.',
+        });
+      }
+    } catch (error) {
+      setFilterMatches([]);
+      setSearchMessage({
+        appearance: 'error',
+        text: error.message || 'Could not search saved filters.',
+      });
+    } finally {
+      setIsSearching(false);
+    }
+  }, [nameQuery]);
 
   const filterOptions = useMemo(
-    () => filters.map((filter) => ({ label: filter.name, value: filter.id })),
-    [filters]
+    () =>
+      filterMatches.map((filter) => ({
+        label: filter.owner ? `${filter.name} — ${filter.owner} (${filter.id})` : `${filter.name} (${filter.id})`,
+        value: filter.id,
+      })),
+    [filterMatches]
   );
 
+  // Works out what to send to the backend based on the selected input mode.
+  // Returns `null` when the current input is incomplete.
+  const reportSource = useMemo(() => {
+    if (sourceMode === 'jql') {
+      return jqlText.trim() ? { sourceType: 'jql', sourceValue: jqlText.trim() } : null;
+    }
+
+    if (sourceMode === 'name') {
+      return selectedMatch ? { sourceType: 'filter', sourceValue: selectedMatch.value } : null;
+    }
+
+    return filterId.trim() ? { sourceType: 'filter', sourceValue: filterId.trim() } : null;
+  }, [sourceMode, jqlText, selectedMatch, filterId]);
+
   const runReport = useCallback(async () => {
+    if (!reportSource) {
+      return;
+    }
+
     setIsLoading(true);
     setReportError(null);
 
     try {
       const result = await invoke('getTimeReport', {
-        filterId: selectedFilter?.value,
+        ...reportSource,
         daysBack: Number(daysBack),
       });
 
@@ -167,7 +234,7 @@ const App = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedFilter, daysBack]);
+  }, [reportSource, daysBack]);
 
   // Build the DynamicTable header: fixed columns first, then one column per day,
   // then a total so users can sanity check a person's week at a glance.
@@ -268,56 +335,132 @@ const App = () => {
             Logged time by person, issue and day
           </Heading>
           <Text color="color.text.subtle">
-            Pick a saved filter and a reporting window. The report shows the hours each person
-            logged against each issue, with its epic, initiative and theme.
+            Scope the report by filter ID, by searching for a filter by name, or with your own JQL.
+            The report shows the hours each person logged against each issue, with its epic,
+            initiative and theme.
           </Text>
         </Stack>
-
-        {filtersError && (
-          <SectionMessage appearance="error" title="Could not load filters">
-            <Text>{filtersError}</Text>
-          </SectionMessage>
-        )}
 
         {/* Toolbar card: a raised surface with a border makes the controls read as
             a distinct Jira-style panel instead of floating on the page. */}
         <Box xcss={toolbarStyles}>
-          <Inline space="space.200" alignBlock="end" shouldWrap>
-            <Box xcss={filterFieldStyles}>
-              <Stack space="space.050">
-                <Label labelFor="filter-select">Saved filter</Label>
-                <Select
-                  id="filter-select"
-                  options={filterOptions}
-                  value={selectedFilter}
-                  onChange={setSelectedFilter}
-                  placeholder="Choose a filter..."
-                  isClearable
-                />
-              </Stack>
-            </Box>
+          <Stack space="space.200">
+            <Stack space="space.050">
+              <Label labelFor="source-mode">Report scope</Label>
+              <RadioGroup
+                id="source-mode"
+                name="source-mode"
+                value={sourceMode}
+                options={[
+                  { name: 'source-mode', value: 'id', label: 'Filter ID' },
+                  { name: 'source-mode', value: 'name', label: 'Search filter by name' },
+                  { name: 'source-mode', value: 'jql', label: 'JQL' },
+                ]}
+                onChange={(event) => setSourceMode(event.target.value)}
+              />
+            </Stack>
 
-            <Box xcss={daysFieldStyles}>
-              <Stack space="space.050">
-                <Label labelFor="days-back">Days back</Label>
-                <Textfield
-                  id="days-back"
-                  type="number"
-                  value={daysBack}
-                  onChange={(event) => setDaysBack(event.target.value)}
-                />
-              </Stack>
-            </Box>
+            {sourceMode === 'id' && (
+              <Box xcss={filterFieldStyles}>
+                <Stack space="space.050">
+                  <Label labelFor="filter-id">Filter ID</Label>
+                  <Textfield
+                    id="filter-id"
+                    placeholder="e.g. 10042"
+                    value={filterId}
+                    onChange={(event) => setFilterId(event.target.value)}
+                  />
+                  <HelperMessage>
+                    The number at the end of a filter URL, e.g. /issues/?filter=10042
+                  </HelperMessage>
+                </Stack>
+              </Box>
+            )}
 
-            <LoadingButton
-              appearance="primary"
-              isLoading={isLoading}
-              isDisabled={!selectedFilter}
-              onClick={runReport}
-            >
-              Run report
-            </LoadingButton>
-          </Inline>
+            {sourceMode === 'name' && (
+              <Stack space="space.100">
+                <Inline space="space.100" alignBlock="end" shouldWrap>
+                  <Box xcss={filterFieldStyles}>
+                    <Stack space="space.050">
+                      <Label labelFor="filter-name">Filter name</Label>
+                      <Textfield
+                        id="filter-name"
+                        placeholder="Type part of a filter name, or leave blank for all"
+                        value={nameQuery}
+                        onChange={(event) => setNameQuery(event.target.value)}
+                      />
+                    </Stack>
+                  </Box>
+                  <LoadingButton isLoading={isSearching} onClick={searchForFilters}>
+                    Search
+                  </LoadingButton>
+                </Inline>
+
+                {searchMessage && (
+                  <SectionMessage appearance={searchMessage.appearance}>
+                    <Text>{searchMessage.text}</Text>
+                  </SectionMessage>
+                )}
+
+                {filterMatches.length > 0 && (
+                  <Box xcss={filterFieldStyles}>
+                    <Stack space="space.050">
+                      <Label labelFor="filter-match">Matching filters</Label>
+                      <Select
+                        id="filter-match"
+                        options={filterOptions}
+                        value={selectedMatch}
+                        onChange={setSelectedMatch}
+                        placeholder="Choose a filter..."
+                        isClearable
+                      />
+                    </Stack>
+                  </Box>
+                )}
+              </Stack>
+            )}
+
+            {sourceMode === 'jql' && (
+              <Stack space="space.050">
+                <Label labelFor="jql-input">JQL</Label>
+                <TextArea
+                  id="jql-input"
+                  isMonospaced
+                  minimumRows={3}
+                  placeholder='project = ABC AND assignee in membersOf("developers")'
+                  value={jqlText}
+                  onChange={(event) => setJqlText(event.target.value)}
+                />
+                <HelperMessage>
+                  Any ORDER BY clause is ignored, and a worklog date condition is added
+                  automatically.
+                </HelperMessage>
+              </Stack>
+            )}
+
+            <Inline space="space.200" alignBlock="end" shouldWrap>
+              <Box xcss={daysFieldStyles}>
+                <Stack space="space.050">
+                  <Label labelFor="days-back">Days back</Label>
+                  <Textfield
+                    id="days-back"
+                    type="number"
+                    value={daysBack}
+                    onChange={(event) => setDaysBack(event.target.value)}
+                  />
+                </Stack>
+              </Box>
+
+              <LoadingButton
+                appearance="primary"
+                isLoading={isLoading}
+                isDisabled={!reportSource}
+                onClick={runReport}
+              >
+                Run report
+              </LoadingButton>
+            </Inline>
+          </Stack>
         </Box>
 
         {reportError && (
@@ -339,7 +482,7 @@ const App = () => {
           <Stack space="space.150">
             <Inline space="space.200" alignBlock="center" spread="space-between">
               <Inline space="space.100" alignBlock="center">
-                <Strong>{report.filterName}</Strong>
+                <Strong>{report.sourceLabel}</Strong>
                 <Lozenge appearance="inprogress">{`${report.rows.length} rows`}</Lozenge>
                 <Lozenge appearance="default">{`${report.issueCount} issues`}</Lozenge>
                 <Lozenge appearance="success">{`${grandTotalHours.toFixed(2)} h`}</Lozenge>
@@ -354,6 +497,12 @@ const App = () => {
                 </Button>
               </ButtonGroup>
             </Inline>
+
+            {/* Showing the query that actually ran makes it obvious why a report
+                came back empty, which is hard to diagnose otherwise. */}
+            <Text color="color.text.subtle" size="small">
+              Query: <Code>{report.jql}</Code>
+            </Text>
 
             <DynamicTable
               head={tableHead}
