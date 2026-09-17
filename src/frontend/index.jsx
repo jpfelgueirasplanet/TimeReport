@@ -117,6 +117,9 @@ const App = () => {
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [isSearching, setIsSearching] = useState(false);
   const [searchMessage, setSearchMessage] = useState(null);
+  // The text the currently displayed results were fetched for, so the label can
+  // never imply the list matches something the user has since retyped.
+  const [searchedFor, setSearchedFor] = useState('');
 
   const [daysBack, setDaysBack] = useState('7');
 
@@ -151,31 +154,36 @@ const App = () => {
    * An empty search box lists everything the user can see.
    */
   const searchForFilters = useCallback(async () => {
+    const query = nameQuery.trim();
+
     setIsSearching(true);
     setSearchMessage(null);
     setSelectedMatch(null);
 
     try {
-      const result = await invoke('searchFilters', { name: nameQuery });
+      const result = await invoke('searchFilters', { name: query });
 
       if (result.error) {
         setFilterMatches([]);
+        setSearchedFor('');
         setSearchMessage({ appearance: 'error', text: result.error });
         return;
       }
 
       setFilterMatches(result.filters);
+      setSearchedFor(query);
 
       if (result.filters.length === 0) {
         setSearchMessage({
           appearance: 'warning',
-          text: nameQuery
-            ? `No filters matched "${nameQuery}". Note that Jira only searches filters you own or that are shared with you.`
+          text: query
+            ? `No filter names contain "${query}". Jira only returns filters you own or that are shared with you.`
             : 'Jira returned no saved filters for your account. Try entering a filter ID or JQL instead.',
         });
       }
     } catch (error) {
       setFilterMatches([]);
+      setSearchedFor('');
       setSearchMessage({
         appearance: 'error',
         text: error.message || 'Could not search saved filters.',
@@ -184,6 +192,20 @@ const App = () => {
       setIsSearching(false);
     }
   }, [nameQuery]);
+
+  /**
+   * Updates the search text and drops any previously fetched results, so the
+   * dropdown never shows filters belonging to an earlier search term.
+   *
+   * @param {string} value the new search text
+   */
+  const changeNameQuery = useCallback((value) => {
+    setNameQuery(value);
+    setFilterMatches([]);
+    setSelectedMatch(null);
+    setSearchMessage(null);
+    setSearchedFor('');
+  }, []);
 
   const filterOptions = useMemo(
     () =>
@@ -387,7 +409,7 @@ const App = () => {
                         id="filter-name"
                         placeholder="Type part of a filter name, or leave blank for all"
                         value={nameQuery}
-                        onChange={(event) => setNameQuery(event.target.value)}
+                        onChange={(event) => changeNameQuery(event.target.value)}
                       />
                     </Stack>
                   </Box>
@@ -405,7 +427,11 @@ const App = () => {
                 {filterMatches.length > 0 && (
                   <Box xcss={filterFieldStyles}>
                     <Stack space="space.050">
-                      <Label labelFor="filter-match">Matching filters</Label>
+                      <Label labelFor="filter-match">
+                        {searchedFor
+                          ? `Filters containing "${searchedFor}" (${filterMatches.length})`
+                          : `All filters (${filterMatches.length})`}
+                      </Label>
                       <Select
                         id="filter-match"
                         options={filterOptions}

@@ -32,8 +32,10 @@ async function readJson(responsePromise, description) {
 /**
  * Returns saved filters the current user can see, optionally narrowed by name.
  *
- * Passing a `nameQuery` uses Jira's own `filterName` matching, which is much
- * more reliable than downloading every filter on a large site.
+ * Jira's `filterName` parameter is sent so the server can do most of the work,
+ * but the results are ALSO matched locally. Jira's partial matching has proven
+ * unreliable here (it can return unrelated filters), and the local pass
+ * guarantees that what lands in the picker actually contains the typed text.
  *
  * @param {string} [nameQuery] partial filter name to search for
  * @returns {Promise<Array<{id: string, name: string, owner: string, jql: string}>>}
@@ -42,16 +44,17 @@ export async function searchFilters(nameQuery) {
   const filters = [];
   let startAt = 0;
   const maxResults = 50;
+  const query = (nameQuery || '').trim();
 
   // `expand=jql,owner` gives us enough to show a helpful label in the picker.
   // `route` must be used as a tagged template so that interpolated values are
   // URL-encoded, so we branch rather than concatenating the optional parameter.
   for (let page = 0; page < 10; page += 1) {
-    const request = nameQuery
+    const request = query
       ? api
           .asUser()
           .requestJira(
-            route`/rest/api/3/filter/search?startAt=${startAt}&maxResults=${maxResults}&orderBy=name&expand=jql,owner&filterName=${nameQuery}`
+            route`/rest/api/3/filter/search?startAt=${startAt}&maxResults=${maxResults}&orderBy=name&expand=jql,owner&filterName=${query}`
           )
       : api
           .asUser()
@@ -77,7 +80,32 @@ export async function searchFilters(nameQuery) {
     startAt += maxResults;
   }
 
-  return filters;
+  if (!query) {
+    return filters;
+  }
+
+  // Local, case-insensitive "contains" match. This is the authoritative filter:
+  // anything Jira returned that does not contain the typed text is discarded.
+  const needle = query.toLowerCase();
+  const matches = filters.filter((filter) => filter.name.toLowerCase().includes(needle));
+
+  console.log(
+    `Filter search for "${query}": Jira returned ${filters.length}, ${matches.length} matched locally.`
+  );
+
+  // Put the most relevant results first: exact name, then prefix, then the rest.
+  return matches.sort((a, b) => {
+    const aName = a.name.toLowerCase();
+    const bName = b.name.toLowerCase();
+
+    const rank = (name) => {
+      if (name === needle) return 0;
+      if (name.startsWith(needle)) return 1;
+      return 2;
+    };
+
+    return rank(aName) - rank(bName) || aName.localeCompare(bName);
+  });
 }
 
 /**
