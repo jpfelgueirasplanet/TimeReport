@@ -50,3 +50,7 @@ Thumbs.db
 
 
 /.forge/
+
+# Forge CLI local container/service assets. May contain account credentials -
+# must never be committed.
+/.container-service-assets/
