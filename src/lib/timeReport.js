@@ -12,9 +12,24 @@
 
 import { getFilter, getIssuesByKeys, getWorklogsForIssue, searchIssues } from './jiraApi';
 
-// Issue type names we treat as "levels" above the working issue. These match the
-// hierarchy that the old `IssueHierarchy` helper resolved on Jira Data Center.
-const HIERARCHY_LEVELS = ['epic', 'initiative', 'theme'];
+// Ancestors are classified by their position in Jira's issue type hierarchy,
+// NOT by their issue type name. Jira exposes `issuetype.hierarchyLevel`:
+//   -1 = sub-task, 0 = base (Story/Task/Bug), 1 = Epic, 2 = Initiative, 3 = Theme
+// Using the level means renamed types such as "Epic (migrated)" still land in
+// the right column, and localised or custom type names work unchanged.
+const LEVEL_TO_COLUMN = {
+  1: 'epic',
+  2: 'initiative',
+  3: 'theme',
+};
+
+// Fallback used only when Jira does not report a hierarchy level: classify
+// purely by how many steps up the parent chain the ancestor sits.
+const DISTANCE_TO_COLUMN = {
+  1: 'epic',
+  2: 'initiative',
+  3: 'theme',
+};
 
 // Fields we need from every issue we touch.
 const ISSUE_FIELDS = ['summary', 'issuetype', 'parent'];
@@ -134,12 +149,15 @@ async function resolveHierarchies(issues) {
     }
   }
 
-  // Now walk each issue's chain and bucket ancestors by their issue type name.
+  // Now walk each issue's chain and bucket ancestors by their hierarchy level.
   const hierarchies = new Map();
 
   for (const issue of issues) {
     const hierarchy = {};
     let current = issue;
+    // Counts how many ancestors we have stepped through, used only when Jira
+    // does not tell us the hierarchy level of a type.
+    let distance = 0;
 
     for (let depth = 0; depth < MAX_HIERARCHY_DEPTH; depth += 1) {
       const parentKey = current.fields?.parent?.key;
@@ -152,12 +170,20 @@ async function resolveHierarchies(issues) {
         break;
       }
 
-      const typeName = (parent.fields?.issuetype?.name || '').toLowerCase();
+      distance += 1;
 
-      // Only record the levels the report cares about, and never overwrite a
-      // closer ancestor of the same type.
-      if (HIERARCHY_LEVELS.includes(typeName) && !hierarchy[typeName]) {
-        hierarchy[typeName] = {
+      const level = parent.fields?.issuetype?.hierarchyLevel;
+
+      // Prefer the structural level. A level of 0 or -1 means the parent is a
+      // Story or sub-task parent rather than an Epic, so it gets no column.
+      const column =
+        typeof level === 'number'
+          ? LEVEL_TO_COLUMN[level]
+          : DISTANCE_TO_COLUMN[distance];
+
+      // Never overwrite a closer ancestor that already claimed this column.
+      if (column && !hierarchy[column]) {
+        hierarchy[column] = {
           key: parent.key,
           summary: parent.fields?.summary || '',
         };
