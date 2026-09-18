@@ -31,8 +31,14 @@ const DISTANCE_TO_COLUMN = {
   3: 'theme',
 };
 
+// Issue link types that represent a hierarchy relationship rather than a plain
+// association. Matching is a case-insensitive substring of the link TYPE name,
+// so "Implements" covers both the "implements" and "is implemented by"
+// directions. Add further type names here if your site uses others.
+const HIERARCHY_LINK_TYPES = ['implement'];
+
 // Fields we need from every issue we touch.
-const ISSUE_FIELDS = ['summary', 'issuetype', 'parent'];
+const ISSUE_FIELDS = ['summary', 'issuetype', 'parent', 'issuelinks'];
 
 // Safety limits. Forge resolvers are killed after ~25 seconds, so we cap the
 // amount of work rather than letting a very broad filter time the app out.
@@ -101,8 +107,18 @@ export function buildReportJql(filterJql, daysBack) {
 }
 
 /**
- * Walks the parent chain of every issue and returns a lookup of
+ * Walks the hierarchy above every issue and returns a lookup of
  * `issueKey -> { epic, initiative, theme }`.
+ *
+ * Two kinds of edge are followed upwards:
+ *   1. The `parent` field (Task -> Epic -> Initiative -> ...).
+ *   2. Issue links whose type is listed in `HIERARCHY_LINK_TYPES`, such as the
+ *      "Implements" link used to attach an Epic to an Initiative.
+ *
+ * Link direction is deliberately ignored. Instead, a linked issue is only
+ * accepted as an ancestor when its hierarchy level is HIGHER than the issue we
+ * came from, which works whether the link was created as "implements" or
+ * "is implemented by" and stops us from walking back down into children.
  *
  * Ancestors are fetched one level at a time in batches, so a three level
  * hierarchy costs three requests rather than one request per issue.
@@ -119,13 +135,60 @@ async function resolveHierarchies(issues) {
     issueCache.set(issue.key, issue);
   }
 
-  // Keys whose details we still need in order to continue walking upwards.
+  /**
+   * Reads the hierarchy level of an issue, or `undefined` when Jira did not
+   * report one.
+   *
+   * @param {object} issue
+   * @returns {number|undefined}
+   */
+  const levelOf = (issue) => {
+    const level = issue?.fields?.issuetype?.hierarchyLevel;
+    return typeof level === 'number' ? level : undefined;
+  };
+
+  /**
+   * Returns every issue key that might sit above the given issue, tagged with
+   * how we found it so the caller can apply the right safety checks.
+   *
+   * @param {object} issue
+   * @returns {Array<{key: string, viaLink: boolean}>}
+   */
+  const candidateAncestors = (issue) => {
+    const candidates = [];
+
+    const parentKey = issue?.fields?.parent?.key;
+    if (parentKey) {
+      candidates.push({ key: parentKey, viaLink: false });
+    }
+
+    for (const link of issue?.fields?.issuelinks || []) {
+      const typeName = (link?.type?.name || '').toLowerCase();
+
+      // Match on the link type name so both directions of the same link type
+      // ("implements" / "is implemented by") are picked up.
+      if (!HIERARCHY_LINK_TYPES.some((allowed) => typeName.includes(allowed))) {
+        continue;
+      }
+
+      const linked = link.outwardIssue || link.inwardIssue;
+      if (linked?.key) {
+        candidates.push({ key: linked.key, viaLink: true });
+      }
+    }
+
+    return candidates;
+  };
+
+  // Breadth-first fetch of everything reachable above the search results, so a
+  // whole level costs one batch of requests rather than one request per issue.
   let pending = new Set();
 
   for (const issue of issues) {
-    const parentKey = issue.fields?.parent?.key;
-    if (parentKey && !issueCache.has(parentKey)) {
-      pending.add(parentKey);
+    for (const candidate of candidateAncestors(issue)) {
+      if (!issueCache.has(candidate.key)) {
+        pending.add(candidate.key);
+      }
     }
   }
 
@@ -141,55 +204,77 @@ async function resolveHierarchies(issues) {
       for (const ancestor of fetched) {
         issueCache.set(ancestor.key, ancestor);
 
-        const grandParentKey = ancestor.fields?.parent?.key;
-        if (grandParentKey && !issueCache.has(grandParentKey)) {
-          pending.add(grandParentKey);
+        for (const candidate of candidateAncestors(ancestor)) {
+          if (!issueCache.has(candidate.key)) {
+            pending.add(candidate.key);
+          }
         }
       }
     }
   }
 
-  // Now walk each issue's chain and bucket ancestors by their hierarchy level.
+  // Now walk upwards from each issue and bucket ancestors by hierarchy level.
   const hierarchies = new Map();
 
   for (const issue of issues) {
     const hierarchy = {};
-    let current = issue;
-    // Counts how many ancestors we have stepped through, used only when Jira
-    // does not tell us the hierarchy level of a type.
-    let distance = 0;
 
-    for (let depth = 0; depth < MAX_HIERARCHY_DEPTH; depth += 1) {
-      const parentKey = current.fields?.parent?.key;
-      if (!parentKey) {
-        break;
+    // `visited` guards against link cycles, which are easy to create by hand.
+    const visited = new Set([issue.key]);
+    let frontier = [{ issue, distance: 0 }];
+
+    for (let depth = 0; depth < MAX_HIERARCHY_DEPTH && frontier.length > 0; depth += 1) {
+      const nextFrontier = [];
+
+      for (const node of frontier) {
+        const nodeLevel = levelOf(node.issue);
+
+        for (const candidate of candidateAncestors(node.issue)) {
+          if (visited.has(candidate.key)) {
+            continue;
+          }
+
+          const ancestor = issueCache.get(candidate.key);
+          if (!ancestor) {
+            continue;
+          }
+
+          const ancestorLevel = levelOf(ancestor);
+
+          if (candidate.viaLink) {
+            // Without levels on both ends we cannot tell "up" from "down" or
+            // sideways, so an unverifiable link is skipped rather than guessed.
+            if (ancestorLevel === undefined || nodeLevel === undefined) {
+              continue;
+            }
+
+            // Links to peers or children are not hierarchy edges.
+            if (ancestorLevel <= nodeLevel) {
+              continue;
+            }
+          }
+
+          visited.add(candidate.key);
+
+          const distance = node.distance + 1;
+          const column =
+            ancestorLevel !== undefined
+              ? LEVEL_TO_COLUMN[ancestorLevel]
+              : DISTANCE_TO_COLUMN[distance];
+
+          // Never overwrite a closer ancestor that already claimed this column.
+          if (column && !hierarchy[column]) {
+            hierarchy[column] = {
+              key: ancestor.key,
+              summary: ancestor.fields?.summary || '',
+            };
+          }
+
+          nextFrontier.push({ issue: ancestor, distance });
+        }
       }
 
-      const parent = issueCache.get(parentKey);
-      if (!parent) {
-        break;
-      }
-
-      distance += 1;
-
-      const level = parent.fields?.issuetype?.hierarchyLevel;
-
-      // Prefer the structural level. A level of 0 or -1 means the parent is a
-      // Story or sub-task parent rather than an Epic, so it gets no column.
-      const column =
-        typeof level === 'number'
-          ? LEVEL_TO_COLUMN[level]
-          : DISTANCE_TO_COLUMN[distance];
-
-      // Never overwrite a closer ancestor that already claimed this column.
-      if (column && !hierarchy[column]) {
-        hierarchy[column] = {
-          key: parent.key,
-          summary: parent.fields?.summary || '',
-        };
-      }
-
-      current = parent;
+      frontier = nextFrontier;
     }
 
     hierarchies.set(issue.key, hierarchy);
