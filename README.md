@@ -1,42 +1,240 @@
-# Forge Hello World
+# Time Report
 
-This project contains a Forge app written in JavaScript that displays `Hello World!` in a Jira full page module.
+A Forge app for Jira Cloud that reports **hours logged per person, per issue and per day**, enriched with each issue's Epic, Initiative and Theme.
 
-See [developer.atlassian.com/platform/forge/](https://developer.atlassian.com/platform/forge) for documentation and tutorials explaining Forge.
+It is the Jira Cloud replacement for the ScriptRunner scripts previously used on Jira Data Center (kept for reference in `../oldImplementation`).
 
-See [Jira full page](https://developer.atlassian.com/platform/forge/manifest-reference/modules/jira-full-page/) for
-information on how to use this module. 
+---
 
-## Requirements
+## What it does
 
-See [Set up Forge](https://developer.atlassian.com/platform/forge/set-up-forge/) for instructions to get set up.
+Pick a set of issues (by saved filter or JQL) and a reporting window. The app produces one row per **(user, issue)** pair, with one column per day:
 
-## Quick start
+| User | Issue Key | Issue Type | Summary | Epic | Epic Summary | Initiative | Initiative Summary | Theme | Theme Summary | 2026-09-11 | … | 2026-09-18 | Total |
+| ---- | --------- | ---------- | ------- | ---- | ------------ | ---------- | ------------------ | ----- | ------------- | ---------- | - | ---------- | ----- |
+| Ana  | ABC-1     | Task       | Do work | ABC-10 | Renamed epic | ABC-20 | An initiative | ABC-30 | A theme | 1.50 | … | 2.00 | 3.50 |
 
-- Modify your app frontend by editing the `src/frontend/index.jsx` file.
+Cells are hours to two decimals, and are left blank when nothing was logged.
 
-- Modify your app backend by editing the `src/resolvers/index.js` file to define resolver functions. See [Forge resolvers](https://developer.atlassian.com/platform/forge/runtime-reference/custom-ui-resolver/) for documentation on resolver functions.
+### Features
 
-- Build and deploy your app by running:
+- **Three ways to scope the report** — filter ID, filter name search, or raw JQL.
+- **Sortable, paginated table** with links straight to each issue.
+- **CSV export** for pasting into a spreadsheet.
+- **Rename-proof hierarchy** — Epic/Initiative/Theme are resolved structurally, not by issue type name.
+- **Link-aware hierarchy** — follows both `parent` and "Implements" issue links.
+- **Runs as the viewer** — every Jira call uses `asUser()`, so people only ever see data they already have permission to see.
+
+---
+
+## Using the app
+
+Open Jira and go to **Apps → Time Report** in the top navigation.
+
+### 1. Choose a report scope
+
+| Mode | What to enter | Notes |
+| ---- | ------------- | ----- |
+| **Filter ID** | e.g. `10042` | The number at the end of a filter URL: `/issues/?filter=10042`. |
+| **Search filter by name** | e.g. `migration` | Press **Search**, then pick from the results. Leave blank to list every filter you can see. |
+| **JQL** | e.g. `project = ABC` | Any `ORDER BY` clause is ignored. |
+
+Only filters you own or that are shared with you are visible — this is Jira's permission model, not an app limitation.
+
+### 2. Choose a window
+
+**Days back** is inclusive of today, so `7` produces **8** columns (today plus the previous seven days). Allowed range is `0`–`180`.
+
+### 3. Run it
+
+The effective query is shown beneath the results, for example:
+
 ```
-forge deploy
+(project = ABC) AND worklogDate >= -7d AND worklogDate <= 1d
 ```
 
-- Install your app in an Atlassian site by running:
+This is the quickest way to understand why a report came back empty.
+
+### Exporting
+
+**Export to CSV** opens a dialog containing the CSV text. Copy it and save it as `time-report.csv`.
+
+> Forge apps are sandboxed in an iframe and cannot write files to your computer, so a true "download" is not possible. The old ScriptRunner `.xlsx` export relied on direct DOM access and loading a script from a CDN, neither of which Forge permits.
+
+---
+
+## How the hierarchy is resolved
+
+The Epic, Initiative and Theme columns are filled by walking **upwards** from each worked issue. This is deliberately independent of what your issue types are called.
+
+### Edges that are followed
+
+1. **The `parent` field** — the standard Jira Cloud hierarchy.
+2. **"Implements" issue links** — configured in `HIERARCHY_LINK_TYPES` (`src/lib/timeReport.js`), matched as a case-insensitive substring of the link *type* name.
+
+### How an ancestor is assigned to a column
+
+Classification uses `issuetype.hierarchyLevel`, the structural position of the type — **never its name**:
+
+| `hierarchyLevel` | Column |
+| ---------------- | ------ |
+| `-1` (sub-task), `0` (Story/Task/Bug) | *none* |
+| `1` | Epic |
+| `2` | Initiative |
+| `3` | Theme |
+
+This is why types renamed to `"Epic (migrated)"` still resolve correctly.
+
+### Safety rules
+
+- **Link direction is ignored.** Both `outwardIssue` and `inwardIssue` are considered; a linked issue is accepted only when its hierarchy level is *strictly higher* than the issue it was reached from. This works whether the link was created as "implements" or "is implemented by".
+- **Peer and child links are rejected** — an Epic that implements another Epic (level 1 → 1) is not mistaken for an Initiative.
+- **Cycles terminate** via a `visited` set.
+- **Sub-tasks are handled** — a sub-task's parent is a Story (level 0), which is skipped so the real Epic above it is found.
+- **Fallback:** if Jira reports no `hierarchyLevel`, `parent` edges are classified by distance (1st ancestor → Epic, 2nd → Initiative, 3rd → Theme). Unverifiable *links* are skipped rather than guessed at.
+
+---
+
+## How worklogs are counted
+
+- The filter's JQL is narrowed with `worklogDate >= -Nd AND worklogDate <= 1d` so Jira only returns issues with work logged in the window.
+- Worklogs are fetched per issue via `startedAfter`, because the issue search endpoint returns at most 20 worklogs per issue.
+- A worklog's date is the leading `yyyy-MM-dd` of its `started` timestamp, which carries the author's own UTC offset. The date therefore matches what the person who logged the work saw — the same behaviour as the Data Center report.
+- Rows are keyed `"User|ISSUE-KEY"` and sorted by user, then issue key.
+
+---
+
+## Architecture
+
 ```
-forge install
+src/
+  index.js              Forge function entry point
+  resolvers/index.js    Resolver definitions: searchFilters, getTimeReport
+  lib/
+    jiraApi.js          Jira REST wrappers (all asUser)
+    timeReport.js       Hierarchy resolution and worklog aggregation
+  frontend/index.jsx    UI Kit page
+manifest.yml            Modules, scopes and resources
 ```
 
-- Develop your app by running `forge tunnel` to proxy invocations locally:
+The resolver returns plain data; the frontend renders it. The same data backs both the table and the CSV export, so they cannot drift apart.
+
+### Jira APIs used
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `GET /rest/api/3/filter/search` | Find filters by name |
+| `GET /rest/api/3/filter/{id}` | Resolve a filter to its JQL |
+| `POST /rest/api/3/search/jql` | Find issues and ancestors |
+| `GET /rest/api/3/issue/{key}/worklog` | Fetch worklogs in the window |
+
+### Scopes
+
+| Scope | Why |
+| ----- | --- |
+| `read:jira-work` | Read filters, issues and worklogs |
+| `read:jira-user` | Show worklog author display names |
+
+### Limits
+
+Forge resolvers are terminated after roughly 25 seconds, so the app caps a single run at:
+
+| Constant | Value | Meaning |
+| -------- | ----- | ------- |
+| `MAX_ISSUES` | 500 | Issues processed per run (a warning banner appears if exceeded) |
+| `MAX_HIERARCHY_DEPTH` | 5 | Levels walked upwards |
+| `WORKLOG_CONCURRENCY` | 10 | Parallel worklog requests |
+
+If you hit the cap, narrow the filter or shorten the window.
+
+---
+
+## Development
+
+Requires the [Forge CLI](https://developer.atlassian.com/platform/forge/set-up-forge/).
+
+```bash
+npm install
 ```
+
+### Validate
+
+```bash
+forge lint          # manifest and app checks
+npx eslint src --ext .js,.jsx
+```
+
+### Deploy
+
+```bash
+forge deploy --non-interactive -e development
+forge deploy --non-interactive -e production
+```
+
+> `forge lint` does not catch every invalid manifest property. Check the page renders after changing `manifest.yml`.
+
+### Environments
+
+Apps in the **development** environment are only accessible to the app owner. Anyone who opens one gets *"You don't have access to this app."* Colleagues must use the **production** install.
+
+| Environment | Who can use it |
+| ----------- | -------------- |
+| `development` | The app owner only |
+| `production` | Everyone on the site |
+
+Production does **not** update automatically — deploy to it explicitly.
+
+### Installing
+
+```bash
+forge install --non-interactive --site <site>.atlassian.net --product jira --environment production
+```
+
+Add `--upgrade` when scopes or permissions have changed. Changing only code needs a deploy, not a reinstall.
+
+### Live development
+
+```bash
 forge tunnel
 ```
 
-### Notes
-- Use the `forge deploy` command when you want to persist code changes.
-- Use the `forge install` command when you want to install the app on a new site.
-- Once the app is installed on a site, the site picks up the new app changes you deploy without needing to rerun the install command.
+Code changes hot-reload. Changing `manifest.yml` requires a redeploy and a tunnel restart.
+
+### Logs
+
+```bash
+forge logs -e development --since 15m
+```
+
+---
+
+## Customising
+
+| Change | Where |
+| ------ | ----- |
+| Hierarchy link types | `HIERARCHY_LINK_TYPES` in `src/lib/timeReport.js` |
+| Level → column mapping | `LEVEL_TO_COLUMN` in `src/lib/timeReport.js` |
+| Issue cap / concurrency | `MAX_ISSUES`, `WORKLOG_CONCURRENCY` in `src/lib/timeReport.js` |
+| Table and CSV columns | `BASE_COLUMNS` in `src/frontend/index.jsx` |
+
+Adding a fourth hierarchy level means adding an entry to `LEVEL_TO_COLUMN`, a row field in `buildTimeReport`, and a column in `BASE_COLUMNS`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause |
+| ------- | ----- |
+| *"You don't have access to this app."* | Opening the **development** install as a non-owner. Use the production link. |
+| Filter search returns nothing | You may not own or have shared access to any filter. Use Filter ID or JQL instead. |
+| Report is empty | Check the query shown under the results; no work was logged in that window. |
+| Epic/Initiative/Theme blank | The ancestor may be linked by a type not listed in `HIERARCHY_LINK_TYPES`, or its issue type has no hierarchy level above 0. |
+| *"Results were truncated"* | The filter matched more than `MAX_ISSUES` issues. Narrow it. |
+
+## UI Kit constraints
+
+The frontend may only use components exported by `@forge/react`. Standard HTML elements (`<div>`, `<span>`) and third-party React components will break rendering. There is no `Table` component — use `DynamicTable`. Styling uses `xcss` with Atlassian design tokens, which is what makes the app follow Jira's theming, including dark mode.
 
 ## Support
 
-See [Get help](https://developer.atlassian.com/platform/forge/get-help/) for how to get help and provide feedback.
+See [Get help](https://developer.atlassian.com/platform/forge/get-help/) for Forge platform support.
