@@ -10,7 +10,16 @@
  * requested window holding the hours logged by that user on that issue.
  */
 
-import { getFilter, getIssuesByKeys, getWorklogsForIssue, searchIssues } from './jiraApi';
+import { getIssuesByKeys, getWorklogsForIssue, searchIssues } from './jiraApi';
+import { andClause, resolveSource } from './jql';
+import {
+  candidateAncestors,
+  levelOf,
+  mapWithConcurrency,
+  LEVEL_EPIC,
+  LEVEL_INITIATIVE,
+  LEVEL_THEME,
+} from './hierarchy';
 
 // Ancestors are classified by their position in Jira's issue type hierarchy,
 // NOT by their issue type name. Jira exposes `issuetype.hierarchyLevel`:
@@ -18,9 +27,9 @@ import { getFilter, getIssuesByKeys, getWorklogsForIssue, searchIssues } from '.
 // Using the level means renamed types such as "Epic (migrated)" still land in
 // the right column, and localised or custom type names work unchanged.
 const LEVEL_TO_COLUMN = {
-  1: 'epic',
-  2: 'initiative',
-  3: 'theme',
+  [LEVEL_EPIC]: 'epic',
+  [LEVEL_INITIATIVE]: 'initiative',
+  [LEVEL_THEME]: 'theme',
 };
 
 // Fallback used only when Jira does not report a hierarchy level: classify
@@ -30,12 +39,6 @@ const DISTANCE_TO_COLUMN = {
   2: 'initiative',
   3: 'theme',
 };
-
-// Issue link types that represent a hierarchy relationship rather than a plain
-// association. Matching is a case-insensitive substring of the link TYPE name,
-// so "Implements" covers both the "implements" and "is implemented by"
-// directions. Add further type names here if your site uses others.
-const HIERARCHY_LINK_TYPES = ['implement'];
 
 // Fields we need from every issue we touch.
 const ISSUE_FIELDS = ['summary', 'issuetype', 'parent', 'issuelinks'];
@@ -79,19 +82,6 @@ export function buildDateColumns(daysBack) {
 }
 
 /**
- * Strips a trailing `ORDER BY` clause from a JQL string.
- *
- * We need to wrap the filter's JQL in parentheses so we can AND an extra
- * `worklogDate` condition onto it, and `(... ORDER BY x)` is not valid JQL.
- *
- * @param {string} jql
- * @returns {string}
- */
-export function stripOrderBy(jql) {
-  return jql.replace(/\s+order\s+by\s+[\s\S]*$/i, '').trim();
-}
-
-/**
  * Combines the saved filter's JQL with a worklog date restriction so Jira only
  * returns issues that actually have work logged inside the reporting window.
  *
@@ -100,10 +90,7 @@ export function stripOrderBy(jql) {
  * @returns {string}
  */
 export function buildReportJql(filterJql, daysBack) {
-  const base = stripOrderBy(filterJql);
-  const worklogClause = `worklogDate >= -${daysBack}d AND worklogDate <= 1d`;
-
-  return base ? `(${base}) AND ${worklogClause}` : worklogClause;
+  return andClause(filterJql, `worklogDate >= -${daysBack}d AND worklogDate <= 1d`);
 }
 
 /**
@@ -134,51 +121,6 @@ async function resolveHierarchies(issues) {
   for (const issue of issues) {
     issueCache.set(issue.key, issue);
   }
-
-  /**
-   * Reads the hierarchy level of an issue, or `undefined` when Jira did not
-   * report one.
-   *
-   * @param {object} issue
-   * @returns {number|undefined}
-   */
-  const levelOf = (issue) => {
-    const level = issue?.fields?.issuetype?.hierarchyLevel;
-    return typeof level === 'number' ? level : undefined;
-  };
-
-  /**
-   * Returns every issue key that might sit above the given issue, tagged with
-   * how we found it so the caller can apply the right safety checks.
-   *
-   * @param {object} issue
-   * @returns {Array<{key: string, viaLink: boolean}>}
-   */
-  const candidateAncestors = (issue) => {
-    const candidates = [];
-
-    const parentKey = issue?.fields?.parent?.key;
-    if (parentKey) {
-      candidates.push({ key: parentKey, viaLink: false });
-    }
-
-    for (const link of issue?.fields?.issuelinks || []) {
-      const typeName = (link?.type?.name || '').toLowerCase();
-
-      // Match on the link type name so both directions of the same link type
-      // ("implements" / "is implemented by") are picked up.
-      if (!HIERARCHY_LINK_TYPES.some((allowed) => typeName.includes(allowed))) {
-        continue;
-      }
-
-      const linked = link.outwardIssue || link.inwardIssue;
-      if (linked?.key) {
-        candidates.push({ key: linked.key, viaLink: true });
-      }
-    }
-
-    return candidates;
-  };
 
   // Breadth-first fetch of everything reachable above the search results, so a
   // whole level costs one batch of requests rather than one request per issue.
@@ -284,36 +226,6 @@ async function resolveHierarchies(issues) {
 }
 
 /**
- * Runs an async mapper over a list with a bounded number of parallel requests.
- * Keeps us well within Jira's rate limits while still being much faster than
- * fetching worklogs one issue at a time.
- *
- * @param {T[]} items
- * @param {number} limit maximum number of in-flight operations
- * @param {(item: T) => Promise<R>} mapper
- * @returns {Promise<R[]>}
- * @template T, R
- */
-async function mapWithConcurrency(items, limit, mapper) {
-  const results = new Array(items.length);
-  let cursor = 0;
-
-  // Each "worker" repeatedly grabs the next unclaimed index until none remain.
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await mapper(items[index]);
-    }
-  }
-
-  const workerCount = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
-  return results;
-}
-
-/**
  * Extracts the calendar date a worklog was logged against.
  *
  * Jira returns `started` with the author's UTC offset baked in, for example
@@ -342,23 +254,7 @@ function worklogDate(worklog) {
  */
 export async function buildTimeReport({ sourceType, sourceValue, daysBack }) {
   // Resolve the scope into a plain JQL string plus a human readable label.
-  let baseJql;
-  let sourceLabel;
-
-  if (sourceType === 'jql') {
-    baseJql = sourceValue;
-    sourceLabel = 'Custom JQL';
-  } else {
-    const filter = await getFilter(sourceValue);
-    baseJql = filter.jql;
-    sourceLabel = `${filter.name} (filter ${filter.id})`;
-
-    if (!baseJql) {
-      throw new Error(
-        `Filter ${filter.id} did not return any JQL. You may not have permission to view it.`
-      );
-    }
-  }
+  const { baseJql, sourceLabel } = await resolveSource({ sourceType, sourceValue });
 
   const dateColumns = buildDateColumns(daysBack);
   const jql = buildReportJql(baseJql, daysBack);

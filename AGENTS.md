@@ -1,8 +1,13 @@
 # This Repository: Time Report
 
-A **Forge (Atlassian Cloud) app** for Jira: a `jira:globalPage` UI Kit report showing hours logged
-per person, per issue and per day, enriched with the Epic / Initiative / Theme the issue rolls up to.
-It is a port of an old ScriptRunner `TimeReport.groovy` Data Center script; the Groovy version
+A **Forge (Atlassian Cloud) app** for Jira: a single `jira:globalPage` UI Kit page with two tabs.
+
+- **Daily by person** — hours logged per person, per issue and per day, enriched with the
+  Epic / Initiative / Theme the issue rolls up to. Walks the hierarchy **up**.
+- **Themes by month** — the filter selects the Themes; the app walks the hierarchy **down** to every
+  descendant and totals their worklogs per calendar month.
+
+It began as a port of an old ScriptRunner `TimeReport.groovy` Data Center script; the Groovy version
 returned HTML, this version returns plain data and renders it with UI Kit.
 
 `README.md` is the user- and operator-facing documentation. This file is the contributor/agent
@@ -17,11 +22,22 @@ scopes, commands), update the README in the same change.**
 | `src/index.js` | Single line: re-exports `handler` from the resolvers |
 | `src/resolvers/index.js` | Resolver definitions — **validation only**, no Jira logic |
 | `src/lib/jiraApi.js` | Thin, typed-by-JSDoc wrappers over Jira Cloud REST v3 |
-| `src/lib/timeReport.js` | All report logic: JQL building, hierarchy walk, aggregation |
-| `src/frontend/index.jsx` | The whole UI Kit app plus CSV generation |
+| `src/lib/jql.js` | Scope resolution (filter id → JQL) and JQL composition |
+| `src/lib/hierarchy.js` | Rules shared by both reports: link types, levels, concurrency, chunking |
+| `src/lib/timeReport.js` | Daily report — upward hierarchy walk, per-day aggregation |
+| `src/lib/themeReport.js` | Theme report — downward hierarchy walk, per-month aggregation |
+| `src/frontend/index.jsx` | App shell: site URL context and the `Tabs` |
+| `src/frontend/ScopeSelector.jsx` | Filter ID / filter name / JQL picker, used by both tabs |
+| `src/frontend/csv.jsx` | `buildCsv` plus the `CsvExport` button and modal |
+| `src/frontend/DailyReport.jsx` | The "Daily by person" tab |
+| `src/frontend/ThemeReport.jsx` | The "Themes by month" tab |
 
 Keep this separation. Resolvers must not call `@forge/api` directly, and `src/lib/*` must not
 import anything from `@forge/react` or `@forge/bridge`.
+
+**Anything both reports need goes in a shared module** (`hierarchy.js`, `jql.js`, `ScopeSelector`,
+`csv.jsx`) rather than being copied into the second one. The two reports disagreeing about what a
+hierarchy edge is would be a silent data bug.
 
 ## Non-negotiable invariants
 
@@ -33,31 +49,41 @@ These encode decisions that were expensive to get right. Do not "simplify" them 
    URL encoding. When a query parameter is optional, branch between two `route` templates
    (see `searchFilters`) rather than interpolating a pre-built string.
 3. **Hierarchy is classified by `issuetype.hierarchyLevel`, not by issue type name**
-   (`1 = Epic, 2 = Initiative, 3 = Theme`). Renamed, custom or localised type names must keep
-   working. Distance-from-issue is only a fallback when Jira reports no level.
-4. **Link direction is ignored; level comparison is authoritative.** A linked issue is only accepted
-   as an ancestor when its hierarchy level is strictly higher than the current node's. This makes
-   both "implements" and "is implemented by" work and prevents walking back down into children.
-   If neither end has a level, the link is skipped — never guessed.
-5. **A worklog's date is the leading `yyyy-MM-dd` of `started`**, i.e. the date as the author saw it
-   in their own timezone. Do not normalise worklog dates to UTC. Date *columns*, by contrast, are
-   built from UTC parts.
+   (`1 = Epic, 2 = Initiative, 3 = Theme`, exported as constants from `hierarchy.js`). Renamed,
+   custom or localised type names must keep working. Distance-from-issue is only a fallback when
+   Jira reports no level.
+4. **Link direction is ignored; level comparison is authoritative.** A linked issue is accepted as
+   an ancestor only when its level is strictly higher, and as a descendant only when it is strictly
+   lower. This makes both "implements" and "is implemented by" work and prevents the walk doubling
+   back on itself. If either end has no level, the link is skipped — never guessed.
+5. **A worklog's date is the leading `yyyy-MM-dd` (or `yyyy-MM`) of `started`**, i.e. the date as
+   the author saw it in their own timezone. Do not normalise worklog dates to UTC. Date and month
+   *columns*, by contrast, are built from UTC parts.
 6. **Resolvers return errors as data (`{ error: '...' }`), they never throw.** The UI renders the
    message; the stack goes to the Forge logs via `console.error`. Keep both.
 7. **`daysBack = N` produces N + 1 columns** (today plus the previous N days). This matches the
-   Groovy report's semantics, and the accepted range is `0..180`.
+   Groovy report's semantics, and the accepted range is `0..180`. The theme report deliberately uses
+   different semantics: **`months = N` produces exactly N columns** (this month plus the previous
+   N - 1), range `1..36`. Do not "harmonise" them.
 8. **Filter JQL is wrapped in parentheses and ANDed with a worklog clause**, so any trailing
    `ORDER BY` must be stripped first (`(... ORDER BY x)` is invalid JQL).
 9. **Row identity is `` `${user}|${ISSUE-KEY}` ``**, as in the Groovy implementation.
-10. **`BASE_COLUMNS` in `src/frontend/index.jsx` is the single source of truth** for the leading
-    table columns *and* the CSV header. Add or reorder a column there only — never in one place.
+10. **Each report's `BASE_COLUMNS` is the single source of truth** for its leading table columns
+    *and* its CSV header. Add or reorder a column there only — never in one place.
+11. **The theme query is run exactly as the user wrote it** — no worklog condition is added — so
+    themes with no activity still appear with zero totals. The daily report is the opposite: it
+    narrows the query so only issues with work in the window come back.
+12. **A descendant is attributed to the first theme that reaches it.** Never let two themes both
+    count the same issue's hours.
 
 ## Safety limits (tune together, never remove)
 
-Forge resolvers are killed after ~25 s, so the work is deliberately capped:
+Forge resolvers are killed after ~25 s, so the work is deliberately capped. Every cap sets
+`truncated: true`, which the UI surfaces as a warning — keep that signal wired up.
 
-- `MAX_ISSUES = 500` — anything beyond this sets `truncated: true`, which the UI surfaces as a
-  warning. Keep that signal wired up.
+**Daily report** (`timeReport.js`):
+
+- `MAX_ISSUES = 500`.
 - `MAX_HIERARCHY_DEPTH = 5` — plus a `visited` set, because hand-made issue links form cycles.
 - `WORKLOG_CONCURRENCY = 10` — via the local `mapWithConcurrency` helper. Do not replace it with an
   unbounded `Promise.all`; that trips Jira rate limits.
@@ -67,6 +93,18 @@ Forge resolvers are killed after ~25 s, so the work is deliberately capped:
 - Worklogs are fetched per issue with `startedAfter` (the search endpoint only returns the first 20
   worklogs per issue), and the window is re-checked locally at both ends because `startedAfter` is
   deliberately widened by one day for timezone offsets.
+
+**Theme report** (`themeReport.js`):
+
+- `MAX_THEMES = 100`, `MAX_DESCENDANTS = 2000`, `MAX_WORKLOG_ISSUES = 600`.
+- The descent asks for a whole level at a time with `parent in (...)`, 100 keys per query. Never
+  degrade this into one query per issue.
+- **Narrow before fetching.** `keysWithWorklogsInWindow` asks Jira which descendants have worklogs in
+  the window (one search per 100 keys) so that only those issues have their worklogs read. A 2,000
+  issue subtree with 30 worked issues costs ~20 searches + 30 reads, not 2,000 reads.
+- Hierarchy searches go through `searchIssuesSafely`, which logs and returns `[]` instead of
+  throwing, because some sites reject the `parent` JQL field. The *top level* theme search still
+  throws, so a bad user query produces a clear error.
 
 ## Jira API notes specific to this app
 
@@ -113,8 +151,13 @@ forge logs -e development --since 15m
 ```
 
 There is no test suite. Validate changes with `npm run lint`, `forge lint`, and a tunnel run.
-The pure functions in `src/lib/timeReport.js` (`buildDateColumns`, `stripOrderBy`, `buildReportJql`)
-are exported specifically so they can be exercised directly — if you add tests, start there.
+The pure functions are exported specifically so they can be exercised directly — if you add tests,
+start with `buildDateColumns` / `buildReportJql` (`timeReport.js`), `stripOrderBy` / `andClause`
+(`jql.js`), and `buildMonthColumns` / `monthWindowBounds` (`themeReport.js`). The month helpers in
+particular guard against month-end and leap-year rollover bugs.
+
+`node` is not on the default `PATH` in every shell here; use
+`export PATH="$HOME/.nvm/versions/node/v24.21.0/bin:$PATH"` before `npx`/`npm`.
 
 ---
 
@@ -242,6 +285,7 @@ Common symptoms in this app and where to look first:
 | --- | --- |
 | Report is empty | The generated `worklogDate` clause — the UI prints the exact JQL under the results |
 | Epic/Initiative/Theme blank | Ancestor has no `hierarchyLevel`, or the link type is not in `HIERARCHY_LINK_TYPES` |
+| A theme totals 0 hours | Descent found no descendants — check link types, `parent` support, and `MAX_HIERARCHY_DEPTH` |
 | "Results were truncated" warning | The filter matched more than `MAX_ISSUES` issues |
 | Filter not found in the name picker | The filter is not owned by or shared with the current user (`asUser`) |
 | Resolver timeout | Too many issues × worklog requests — check the limits above |
